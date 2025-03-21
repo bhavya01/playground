@@ -25,6 +25,7 @@ import random
 import shutil
 from contextlib import nullcontext
 from pathlib import Path
+import time
 
 import accelerate
 import datasets
@@ -949,6 +950,7 @@ def main(args):
         train_loss = 0.0
         step = -1
         while True:
+            s_time = time.time()
             step += 1
             batch = next(train_dataloader)
             # Sample noise that we'll add to the latents
@@ -996,6 +998,7 @@ def main(args):
             prompt_embeds = batch["prompt_embeds"].to(weight_dtype)
             pooled_prompt_embeds = batch["pooled_prompt_embeds"]
             unet_added_conditions.update({"text_embeds": pooled_prompt_embeds})
+            print(f"time before unet: {time.time()-s_time}")
             model_pred = unet(
                 noisy_model_input,
                 timesteps,
@@ -1004,6 +1007,7 @@ def main(args):
                 return_dict=False,
             )[0]
             print("model_pred.shape", model_pred.shape, flush=True)
+            print(f"time after unet: {time.time()-s_time}")
 
             # Get the target for loss depending on the prediction type
             if args.prediction_type is not None:
@@ -1056,6 +1060,7 @@ def main(args):
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
+            print(f"total time: {time.time()-s_time}")
 
             progress_bar.update(1)
             global_step += 1
