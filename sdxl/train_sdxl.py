@@ -64,9 +64,16 @@ xr.use_spmd()
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.33.0.dev0")
+# check_min_version("0.33.0.dev0")
 
-logger = get_logger(__name__)
+# logger = get_logger(__name__)
+
+class Logger:
+    def info(self, log: str):
+        print(log, flush=True)
+
+logger = Logger()
+
 DATASET_NAME_MAPPING = {
     "lambdalabs/naruto-blip-captions": ("image", "text"),
 }
@@ -142,13 +149,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--device_prefetch_size",
         type=int,
-        default=4,
+        default=1,
         help="Torch xla mp device loader prefetch to xla device"
     )
     parser.add_argument(
         "--loader_prefetch_size",
         type=int,
-        default=4,
+        default=1,
         help="Torch xla mp device loader prefetch from native torch dataloader"
     )
     parser.add_argument(
@@ -494,7 +501,11 @@ def encode_prompt(batch, text_encoders, tokenizers, proportion_empty_prompts, ca
             captions.append(random.choice(caption) if is_train else caption[0])
 
     with torch.no_grad():
+        # First text encoder is ClipTextModel(768 hidden dim)
+        # Second text encoder is ClipTextModelWithProjection(1280 hidden dim)
         for tokenizer, text_encoder in zip(tokenizers, text_encoders):
+            # text_inputs is a dict with keys input_ids, attention_mask
+            # input_ids (captions size, tokenizer_seq_len(77))
             text_inputs = tokenizer(
                 captions,
                 padding="max_length",
@@ -503,34 +514,39 @@ def encode_prompt(batch, text_encoders, tokenizers, proportion_empty_prompts, ca
                 return_tensors="pt",
             )
             text_input_ids = text_inputs.input_ids
+            # (Final output, pooled_output, TextModel(last_hidden_state, all_hidden_states))
             prompt_embeds = text_encoder(
                 text_input_ids.to(text_encoder.device),
                 output_hidden_states=True,
                 return_dict=False,
             )
-
             # We are only ALWAYS interested in the pooled output of the final text encoder
             pooled_prompt_embeds = prompt_embeds[0]
             prompt_embeds = prompt_embeds[-1][-2]
             bs_embed, seq_len, _ = prompt_embeds.shape
             prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
             prompt_embeds_list.append(prompt_embeds)
+            xm.mark_step()
 
+    # (num_samples, seq_len, 768+1280)
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+    # (num_samples, 1280)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
     return {"prompt_embeds": prompt_embeds.cpu(), "pooled_prompt_embeds": pooled_prompt_embeds.cpu()}
 
 
 def compute_vae_encodings(batch, vae):
     images = batch.pop("pixel_values")
+    # pixel_values: (batch, num_channels, height, width)
     pixel_values = torch.stack(list(images))
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
     pixel_values = pixel_values.to(vae.device, dtype=vae.dtype)
 
     with torch.no_grad():
         model_input = vae.encode(pixel_values).latent_dist.sample()
+    # model_input: (batch, 4, 128, 128)
     model_input = model_input * vae.config.scaling_factor
-
+    xm.mark_step()
     # There might have slightly performance improvement
     # by changing model_input.cpu() to accelerator.gather(model_input)
     return {"model_input": model_input.cpu()}
@@ -663,7 +679,7 @@ def main(args):
     # Move unet, vae and text_encoder to device and cast to weight_dtype
     # The VAE is in float32 to avoid NaN losses.
     # TODO (bbahl): Verify that this works
-    vae = vae.to(xla_device, dtype=torch.weight_dtype)
+    vae = vae.to(xla_device, dtype=weight_dtype)
     text_encoder_one = text_encoder_one.to(xla_device, dtype=weight_dtype)
     text_encoder_two = text_encoder_two.to(xla_device, dtype=weight_dtype)
     unet = unet.to(xla_device, dtype=weight_dtype)
@@ -802,9 +818,11 @@ def main(args):
     # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
     new_fingerprint = Hasher.hash(args)
     new_fingerprint_for_vae = Hasher.hash((vae_path, args))
+    print("Computing embeddings for train dataset prompts ...", flush=True)
     train_dataset_with_embeddings = train_dataset.map(
         compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint
     )
+    print("Computing vae encodings for train dataset images ...", flush=True)
     train_dataset_with_vae = train_dataset.map(
         compute_vae_encodings_fn,
         batched=True,
@@ -843,9 +861,9 @@ def main(args):
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
-
     mesh = xs.get_1d_mesh("data")
     xs.set_global_mesh(mesh)
+    # This needs a dataloader fix, original_sizes and crop_top_lefts are lists instead of torch tensors
     train_dataloader = pl.MpDeviceLoader(
         train_dataloader,
         xla_device,
@@ -926,9 +944,13 @@ def main(args):
         desc="Steps",
     )
 
+    train_dataloader = iter(train_dataloader)
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
-        for step, batch in enumerate(train_dataloader):
+        step = -1
+        while True:
+            step += 1
+            batch = next(train_dataloader)
             # Sample noise that we'll add to the latents
             model_input = batch["model_input"]
             noise = torch.randn_like(model_input)
@@ -941,6 +963,7 @@ def main(args):
             bsz = model_input.shape[0]
             if args.timestep_bias_strategy == "none":
                 # Sample a random timestep for each image without bias.
+                print(f"noise_scheduler.config.num_train_timesteps {noise_scheduler.config.num_train_timesteps}", flush=True)
                 timesteps = torch.randint(
                     0, noise_scheduler.config.num_train_timesteps, (bsz,), device=model_input.device
                 )
@@ -980,12 +1003,14 @@ def main(args):
                 added_cond_kwargs=unet_added_conditions,
                 return_dict=False,
             )[0]
+            print("model_pred.shape", model_pred.shape, flush=True)
 
             # Get the target for loss depending on the prediction type
             if args.prediction_type is not None:
                 # set prediction_type of scheduler if defined
                 noise_scheduler.register_to_config(prediction_type=args.prediction_type)
 
+            print(f"noise_scheduler.config.prediction_type {noise_scheduler.config.prediction_type}", flush=True)
             if noise_scheduler.config.prediction_type == "epsilon":
                 target = noise
             elif noise_scheduler.config.prediction_type == "v_prediction":
@@ -1033,6 +1058,7 @@ def main(args):
             optimizer.zero_grad()
 
             progress_bar.update(1)
+            global_step += 1
             # TODO(bbahl): Verify the accelerator.sync_gradients path.
             # Checks if the accelerator has performed an optimization step behind the scenes
             # if accelerator.sync_gradients:
@@ -1045,8 +1071,8 @@ def main(args):
 
                 # Removed the checkpoint code from here.
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
+            # logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            # progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
                 break
